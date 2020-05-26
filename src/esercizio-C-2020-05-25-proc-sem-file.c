@@ -50,176 +50,243 @@ int main() {
 ```
 */
 
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
+
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <fcntl.h>           /* For O_* constants */
-#include <sys/stat.h>        /* For mode constants */
-#include <unistd.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <sys/mman.h>
+
 #include <errno.h>
-#include <semaphore.h>
 #include <pthread.h>
+#include <semaphore.h>
 
-#define FILE_SIZE (1024*1024)
-
+//#define FILE_SIZE (1024*1024)
+#define FILE_SIZE 100
 #define N 4
+
+sem_t *proc_sem;
+sem_t *mutex;
+
+//int create_file_set_size(char *file_name, unsigned int file_size);
+//void soluzione_A();
+//void read_write_in_file(int fd, int i);
 
 #define CHECK_ERR(a,msg) {if ((a) == -1) { perror((msg)); exit(EXIT_FAILURE); } }
 #define CHECK_ERR_MMAP(a,msg) {if ((a) == MAP_FAILED) { perror((msg)); exit(EXIT_FAILURE); } }
 
-sem_t proc_sem;
-sem_t mutex;
-
 int create_file_set_size(char *file_name, unsigned int file_size) {
-
 	int res;
 	int fd = open(file_name,
-	O_CREAT | O_RDWR,
-	S_IRUSR | S_IWUSR);
+	O_CREAT | O_TRUNC | O_RDWR,
+	S_IRUSR | S_IWUSR // l'utente proprietario del file avrà i permessi di lettura e scrittura sul nuovo file
+	);
 
-	if (fd == -1) { // errore!
-		perror("open()");
-		return -1;
-	}
-
-	res = ftruncate(fd, 0);
-	if (res == -1) {
-		perror("ftruncate()");
-		return -1;
-	}
+	CHECK_ERR(fd, "open file")
 
 	res = ftruncate(fd, file_size);
-	if (res == -1) {
-		perror("ftruncate()");
-		return -1;
-	}
+	CHECK_ERR(res, "ftruncate()")
 
 	return fd;
 }
 
-void write_in_file(int *fd, int i, off_t file_offset) {
+void read_write_in_file(int fd, int i) {
 
-	char text = 'A' + (char) i;
+	char append_message = 'A' + (char) i;
+	char tmp;
+	int res;
 
-	if (lseek(*fd, file_offset, SEEK_SET) == -1) {
-		perror("lseek");
-		exit(EXIT_FAILURE);
-	}
-
-	// 3.4.2 Mutual exclusion solution, pag. 19
-	if (sem_wait(&mutex) == -1) {
+	if (sem_wait(mutex) == -1) {
 		perror("sem_wait");
 		exit(EXIT_FAILURE);
 	}
-	printf("Scrittura\n");
-	// posizioniamo l'offset in fondo al file
-	if ((lseek(*fd, file_offset, SEEK_SET)) == -1) {
-		perror("lseek()");
+
+	while ((res = read(fd, &tmp, 1)) > 0 && tmp != 0)
+		;
+	if (res <= 0) {
+		if (sem_post(mutex) == -1) {
+			perror("sem_post");
+			exit(EXIT_FAILURE);
+		}
+		printf("CHILD numero %d EXIT_SUCCESS\n", i);
+		exit(EXIT_SUCCESS);
+	}
+	res = lseek(fd, -1, SEEK_CUR);
+	CHECK_ERR(res, "Lseek");
+
+	printf("CHILD %d scrive a offset %d\n", i, res);
+	res = write(fd, &append_message, sizeof(append_message));
+	CHECK_ERR(res, "Write error")
+
+	if (sem_post(mutex) == -1) {
+		perror("sem_post");
 		exit(EXIT_FAILURE);
 	}
 
-	int res = write(*fd, &text, sizeof(text));
+	return;
+}
 
-	if (res == -1) {
-		perror("write()");
+void write_mmap(char * mmap_addr, int i) {
+	char append_message = 'A' + (char) i;
+	int index = 0;
+
+	if (sem_wait(mutex) == -1) {
+		perror("sem_wait");
 		exit(EXIT_FAILURE);
 	}
-	if (sem_post(&mutex) == -1) {
+
+	while ((mmap_addr[index] != 0) && (index < FILE_SIZE))
+		index++;
+
+	if (index == FILE_SIZE) {
+		if (sem_post(mutex) == -1) {
+			perror("sem_post");
+			exit(EXIT_FAILURE);
+		}
+		printf("CHILD numero %d EXIT_SUCCESS\n", i);
+		exit(EXIT_SUCCESS);
+	}
+	printf("CHILD %d scrive in posizione %d\n", i, index);
+	mmap_addr[index] = append_message;
+
+	if (sem_post(mutex) == -1) {
 		perror("sem_post");
 		exit(EXIT_FAILURE);
 	}
 	return;
 }
 
-void soluzione_A(void) {
-	// usare le system call open(), lseek(), write()
-	char * file_name = "output_soluzione_A.txt";
-	int fd;
-	fd = create_file_set_size(file_name, FILE_SIZE);
-
-	CHECK_ERR(fd, "create_file_set_size");
-
-	int res;
-	char *tmp;
-
-	tmp = malloc(FILE_SIZE);
+void soluzione_A() {
+//	usare le system call open(), lseek(), write()
+	char *file_name = "output_A.txt";
+	unsigned int file_size = FILE_SIZE;
+	int fd = create_file_set_size(file_name, file_size);
+	pid_t pid;
 
 	for (int i = 0; i < N; i++) {
-
-		switch (fork()) {
+		pid = fork();
+		switch (pid) {
 		case 0:
-
-			if ((res = read(fd, tmp, FILE_SIZE)) == -1) {
-				perror("read error");
-				exit(EXIT_FAILURE);
-			}
-
-			for (int k = 0; k < FILE_SIZE; k++) {
-				if (sem_wait(&proc_sem) == -1) {
+			while (1) {
+				if (sem_wait(proc_sem) == -1) {
 					perror("sem_wait");
 					exit(EXIT_FAILURE);
 				}
-
-				if (tmp[k] == 0)
-					write_in_file(&fd, i, k);
-				if (lseek(fd, 0, SEEK_CUR) == -1) {
-					perror("lseek");
-					exit(EXIT_FAILURE);
-							}
+				read_write_in_file(fd, i);
 			}
-			exit(EXIT_SUCCESS);
+			break;
 		case -1:
 			perror("fork()");
 			exit(EXIT_FAILURE);
 		default:
-			for (int i = 0; i < FILE_SIZE + N; i++) {
-				if (sem_post(&proc_sem) == -1) {
-					perror("sem_post");
-					exit(EXIT_FAILURE);
-				}
-			}
-
-			if (wait(NULL) == -1) {
-				perror("wait");
-				exit(EXIT_FAILURE);
-			}
+			;
 		}
 	}
-	printf("Soluzione A completata, BYE!\n");
+	for (int i = 0; i < FILE_SIZE + N; i++) {
+		if (sem_post(proc_sem) == -1) {
+			perror("sem_post");
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	for (int j = 0; j < N; j++)
+		wait(NULL);
+
+	printf("Soluzione A completata BYE!\n");
+	return;
+}
+
+void soluzione_B() {
+//	usare le system call open(), mmap()
+	char *file_name = "output_B.txt";
+	unsigned int file_size = FILE_SIZE;
+	char * file_mmap;
+	int fd = create_file_set_size(file_name, file_size);
+
+	pid_t pid;
+
+	file_mmap = mmap(NULL, // NULL: è il kernel a scegliere l'indirizzo
+			file_size, // dimensione della memory map
+			PROT_READ | PROT_WRITE, // memory map leggibile e scrivibile
+			MAP_SHARED, // memory map condivisibile con altri processi
+			fd, // agganciamento al fd del file
+			0); // offset nel file
+
+	CHECK_ERR_MMAP(file_mmap, "file mapping error");
+	close(fd);
+	// opzionale
+	memset(file_mmap, 0x00, file_size);
+
+	for (int i = 0; i < N; i++) {
+		pid = fork();
+		switch (pid) {
+		case 0:
+			while (1) {
+				if (sem_wait(proc_sem) == -1) {
+					perror("sem_wait");
+					exit(EXIT_FAILURE);
+				}
+				write_mmap(file_mmap, i);
+			}
+			break;
+		case -1:
+			perror("fork()");
+			exit(EXIT_FAILURE);
+		default:
+			;
+		}
+	}
+	for (int i = 0; i < FILE_SIZE + N; i++) {
+		if (sem_post(proc_sem) == -1) {
+			perror("sem_post");
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	for (int j = 0; j < N; j++)
+		wait(NULL);
+
+	printf("Soluzione B completata BYE!\n");
 	return;
 }
 
 
-void soluzione_B(void) {
-	// usare le system call open(), mmap()
-}
 
-int main() {
 
-	int res = sem_init(&proc_sem,
-					1, 	// 1 => il semaforo è condiviso tra processi, 0 => il semaforo è condiviso tra threads del processo
-					1 	// valore iniziale del semaforo (se mettiamo 0 che succede?)
-					);
 
-	CHECK_ERR(res, "sem_init (proc_sem)")
+/******************************************************************************************/
+int main(int argc, char *argv[]) {
 
-	res = sem_init(&mutex,
-					1, 	// 1 => il semaforo è condiviso tra processi, 0 => il semaforo è condiviso tra threads del processo
-					1 	// valore iniziale del semaforo (se mettiamo 0 che succede?)
-					);
+	int res;
 
-	CHECK_ERR(res, "sem_init (mutex)")
+	proc_sem = mmap(NULL, // NULL: è il kernel a scegliere l'indirizzo
+			sizeof(sem_t) * 2, // dimensione della memory map
+			PROT_READ | PROT_WRITE, // memory map leggibile e scrivibile
+			MAP_SHARED | MAP_ANONYMOUS, // memory map condivisibile con altri processi e senza file di appoggio
+			-1, 0); // offset nel file
+	CHECK_ERR_MMAP(proc_sem, "mmap")
 
-    printf("ora avvio la soluzione_A()...\n");
-    soluzione_A();
+	mutex = proc_sem + 1;
+	res = sem_init(proc_sem, 1, // 1 => il semaforo è condiviso tra processi, 0 => il semaforo è condiviso tra threads del processo
+			0 // valore iniziale del semaforo
+			);
+	CHECK_ERR(res, "Sem init")
 
-//    printf("ed ora avvio la soluzione_B()...\n");
-//    soluzione_B();
+	res = sem_init(mutex, 1, // 1 => il semaforo è condiviso tra processi, 0 => il semaforo è condiviso tra threads del processo
+			1 // valore iniziale del semaforo (se mettiamo 0 che succede?)
+			);
+	CHECK_ERR(res, "Mutex init")
 
-    printf("bye!\n");
-    return 0;
+	printf("ora avvio la soluzione_A()...\n");
+	soluzione_A();
+
+	printf("ed ora avvio la soluzione_B()...\n");
+	soluzione_B();
+
+	printf("bye!\n");
+	return 0;
 }
